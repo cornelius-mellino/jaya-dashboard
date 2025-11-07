@@ -9,7 +9,7 @@
 pip
 numpy
 pandas
-matplotlib
+matplotlib.plotly
 seaborn
 scikit_learn
 streamlit
