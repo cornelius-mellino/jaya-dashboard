@@ -6,6 +6,7 @@
 #streamlit==1.51.0
 #streamlit[charts]
 
+pip
 numpy
 pandas
 matplotlib
