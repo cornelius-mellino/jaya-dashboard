@@ -25,7 +25,7 @@ st.set_page_config(
 # Tentukan nama file
 FILE_PATH = 'data.csv'
 
-# Kolom Fitur untuk Model (harus sama dengan yang digunakan saat pelatihan)
+# Daftar Fitur (Sama seperti yang digunakan saat pelatihan)
 NUMERIC_FEATURES = [
     'Admission grade', 'Previous qualification (grade)', 'Age at enrollment',
     'Unemployment rate', 'Inflation rate', 'GDP',
@@ -58,12 +58,15 @@ def load_and_prepare_data(file_path):
     
     # 2. Pembersihan & Feature Engineering
     df.drop_duplicates(inplace=True)
+    # Target 1=Dropout, 0=Not Dropout (Graduate/Enrolled)
     df['Target_Biner'] = df['Target'].map({'Dropout': 1, 'Graduate': 0, 'Enrolled': 0})
     
     # 3. Seleksi Fitur (Hapus fitur 2nd sem dan kolom target asli)
+    target_original = df['Target'].copy() # Simpan target original untuk EDA
     df = df.drop('Target', axis=1)
     if 'Application order' in df.columns:
         df = df.drop('Application order', axis=1)
+    # Hapus kolom semester 2 (pencegahan data leakage)
     cols_to_drop = [col for col in df.columns if '2nd sem' in col]
     df = df.drop(cols_to_drop, axis=1)
     
@@ -74,29 +77,26 @@ def load_and_prepare_data(file_path):
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
-    return X_train, X_test, y_train, y_test, X, y
+    return X_train, X_test, y_train, y_test, X, y, target_original
 
 # Fungsi untuk melatih model dan mendapatkan pipeline (Gunakan cache)
 @st.cache_resource
 def train_model(X_train, y_train):
-    # Pipeline untuk data numerik
+    # Pipeline Preprocessing (Imputasi, Scaling, Encoding)
     numeric_transformer = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler())
     ])
 
-    # Pipeline untuk data kategorikal
     categorical_transformer = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='most_frequent')),
         ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
     ])
     
-    # Pipeline untuk data biner
     binary_transformer = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='most_frequent'))
     ])
 
-    # Gabungkan semua transformer
     preprocessor = ColumnTransformer(
         transformers=[
             ('num', numeric_transformer, NUMERIC_FEATURES),
@@ -106,7 +106,7 @@ def train_model(X_train, y_train):
         remainder='drop'
     )
     
-    # Buat instance model Random Forest
+    # Model Random Forest dengan class_weight='balanced'
     rf_model = RandomForestClassifier(random_state=42, class_weight='balanced')
 
     # Gabungkan preprocessor dan model
@@ -126,10 +126,13 @@ def get_feature_importance(model_pipeline, X):
     preprocessor = model_pipeline.named_steps['preprocessor']
     
     # Dapatkan nama fitur setelah OHE
-    ohe_feature_names = preprocessor.named_transformers_['cat'] \
-                        .named_steps['onehot'] \
-                        .get_feature_names_out(CATEGORICAL_FEATURES)
-    
+    try:
+        ohe_feature_names = preprocessor.named_transformers_['cat'] \
+                            .named_steps['onehot'] \
+                            .get_feature_names_out(CATEGORICAL_FEATURES)
+    except AttributeError:
+        ohe_feature_names = [f'Cat_{i}' for i in range(X.shape[1] - len(NUMERIC_FEATURES) - len(BINARY_FEATURES))]
+        
     all_feature_names = NUMERIC_FEATURES + list(ohe_feature_names) + BINARY_FEATURES
     
     # Dapatkan nilai importance
@@ -147,19 +150,32 @@ def get_feature_importance(model_pipeline, X):
 # ==============================================================================
 
 # Header
-st.title("🎓 Dashboard Deteksi Dropout Dini Mahasiswa")
-st.markdown("Aplikasi berbasis Model Random Forest untuk memprediksi risiko *dropout* setelah Semester 1.")
+st.title("🎓 Dashboard Deteksi Risiko Dropout Dini Mahasiswa")
+st.markdown("Aplikasi berbasis **Model Random Forest** untuk memprediksi risiko *dropout* setelah Semester 1 (S1).")
 
 # Memuat dan melatih model
 try:
-    X_train, X_test, y_train, y_test, X_full, y_full = load_and_prepare_data(FILE_PATH)
+    X_train, X_test, y_train, y_test, X_full, y_full, target_original = load_and_prepare_data(FILE_PATH)
+    # Gabungkan kembali X_full dan target_original untuk EDA
+    df_eda = pd.concat([X_full.reset_index(drop=True), target_original.reset_index(drop=True)], axis=1)
+    
     model_pipeline = train_model(X_train, y_train)
     y_pred = model_pipeline.predict(X_test)
-    y_proba = model_pipeline.predict_proba(X_test)[:, 1] # Probabilitas Dropout
+    
+    # Ambil metrik performa awal
+    report = classification_report(y_test, y_pred, output_dict=True)
+    dropout_metrics = report['1'] # Kelas 1 adalah Dropout
+    accuracy = model_pipeline.score(X_test, y_test)
+    
+except FileNotFoundError:
+    st.error(f"⚠️ **Error:** File '{FILE_PATH}' tidak ditemukan. Mohon pastikan file CSV berada di direktori yang sama.")
+    st.stop()
 except Exception as e:
-    st.error(f"Gagal memuat atau melatih model. Pastikan file '{FILE_PATH}' ada di direktori yang sama. Error: {e}")
+    st.error(f"⚠️ **Gagal memuat atau melatih model.** Pastikan format data (delimiter: ';') sudah benar. Error: {e}")
     st.stop()
 
+st.sidebar.header("⚙️ Konfigurasi & Intervensi")
+st.sidebar.markdown("Gunakan bagian ini untuk memprediksi risiko seorang mahasiswa.")
 
 # ==================================================
 # Bagian 1: Model Performance & Metrik
@@ -169,232 +185,219 @@ st.header("1. Kinerja Model Random Forest")
 col1, col2, col3 = st.columns(3)
 
 # Akurasi
-accuracy = model_pipeline.score(X_test, y_test)
-col1.metric("Akurasi Model", f"{accuracy:.2%}")
+col1.metric("Akurasi Keseluruhan", f"{accuracy:.2%}")
 
 # Presisi & Recall (Fokus pada kelas Dropout/1)
-report = classification_report(y_test, y_pred, output_dict=True)
+col2.metric("Presisi (Menduga Dropout)", f"{dropout_metrics['precision']:.2f}", help="Tingkat kebenaran prediksi 'Dropout'.")
+col3.metric("Recall (Mengidentifikasi Dropout)", f"{dropout_metrics['recall']:.2f}", help="Tingkat keberhasilan model menangkap kasus 'Dropout' yang sebenarnya.")
 
-dropout_metrics = report['1'] # Fix: Use '1' as key for the Dropout class
-col2.metric("Presisi (Menduga Dropout)", f"{dropout_metrics['precision']:.2f}")
-col3.metric("Recall (Mengidentifikasi Dropout)", f"{dropout_metrics['recall']:.2f}")
-
-st.markdown("""
-<div style="border-left: 5px solid #ff4b4b; padding: 10px; margin-bottom: 20px;">
-    <b>Interpretasi Kinerja:</b>
-    <ul>
-        <li><b>Presisi:</b> Dari semua siswa yang diprediksi <b>Dropout</b>, <code>{:.0f}%</code> benar-benar <b>Dropout</b>.</li>
-        <li><b>Recall:</b> Dari semua siswa yang sebenarnya <b>Dropout</b>, model berhasil mengidentifikasi <code>{:.0f}%</code> di antaranya.</li>
-    </ul>
-</div>
-""".format(dropout_metrics['precision']*100, dropout_metrics['recall']*100), unsafe_allow_html=True)
-
-# Confusion Matrix
-st.subheader("Visualisasi Confusion Matrix")
-fig, ax = plt.subplots(figsize=(8, 6))
-ConfusionMatrixDisplay.from_predictions(
-    y_test,
-    y_pred,
-    display_labels=['Tidak Dropout', 'Dropout'],
-    cmap='Blues',
-    ax=ax
+st.markdown(
+    """
+    <div style="border-left: 5px solid #007bff; padding: 10px; margin-bottom: 20px; background-color: #f0f8ff;">
+        <b>Tujuan Metrik:</b> Untuk deteksi dini, <b>Recall</b> yang tinggi pada kelas 'Dropout' sangat penting untuk intervensi yang berhasil.
+    </div>
+    """, unsafe_allow_html=True
 )
-ax.set_title('Confusion Matrix Model Random Forest')
-st.pyplot(fig)
 
 # ==================================================
-# Bagian 2: Feature Importance (Wawasan Bisnis)
+# Bagian 2: Exploratory Data Analysis (EDA) Charts
 # ==================================================
-st.header("2. Faktor Pendorong Utama Dropout")
-st.markdown("Fitur-fitur ini menunjukkan variabel mana yang paling kuat memengaruhi keputusan model untuk memprediksi *dropout*.")
+st.header("2. Exploratory Data Analysis (EDA) Kunci")
+st.markdown("Analisis visual dari data mentah untuk memahami faktor pendorong risiko.")
 
+tab1, tab2 = st.tabs(["Distribusi & Finansial", "Performa Akademik"])
+
+with tab1:
+    col_dist, col_fin = st.columns(2)
+    
+    # Grafik 1: Distribusi Target (Count Plot)
+    with col_dist:
+        st.subheader("Distribusi Status Mahasiswa")
+        fig, ax = plt.subplots(figsize=(5, 4))
+        sns.countplot(data=df_eda, x='Target', order=df_eda['Target'].value_counts().index, palette='viridis', ax=ax)
+        ax.set_title('Status Akhir Mahasiswa')
+        ax.set_xlabel('Status Akhir')
+        ax.set_ylabel('Jumlah Mahasiswa')
+        st.pyplot(fig)
+    
+    # Grafik 4: UKT vs. Target (Count Plot)
+    with col_fin:
+        st.subheader("Status UKT vs. Risiko Dropout")
+        fig, ax = plt.subplots(figsize=(5, 4))
+        sns.countplot(data=df_eda, x='Tuition fees up to date', hue='Target', palette='magma', ax=ax)
+        ax.set_title('Kelancaran UKT vs. Status')
+        ax.set_xlabel('UKT Lancar (1=Ya, 0=Tidak)')
+        ax.set_ylabel('Jumlah Mahasiswa')
+        ax.legend(title='Status Akhir')
+        st.pyplot(fig)
+        st.caption("Fokus: Proporsi Dropout yang sangat tinggi ketika UKT 'Tidak Lancar' (0).")
+
+
+with tab2:
+    col_grade, col_approved = st.columns(2)
+    
+    # Grafik 7: Nilai Semester 1 vs. Target (Box Plot)
+    with col_grade:
+        st.subheader("Rata-rata Nilai Semester 1")
+        fig, ax = plt.subplots(figsize=(5, 4))
+        sns.boxplot(data=df_eda, x='Target', y='Curricular units 1st sem (grade)', palette='viridis', ax=ax)
+        ax.set_title('Nilai S1 vs. Status')
+        ax.set_xlabel('Status Akhir')
+        ax.set_ylabel('Nilai S1')
+        st.pyplot(fig)
+        st.caption("Fokus: Median Nilai Dropout jauh lebih rendah dibandingkan Graduate/Enrolled.")
+
+    # Grafik 9: Unit Lulus Semester 1 vs. Target (Box Plot)
+    with col_approved:
+        st.subheader("Jumlah Unit Lulus Semester 1")
+        fig, ax = plt.subplots(figsize=(5, 4))
+        sns.boxplot(data=df_eda, x='Target', y='Curricular units 1st sem (approved)', palette='viridis', ax=ax)
+        ax.set_title('Unit Lulus S1 vs. Status')
+        ax.set_xlabel('Status Akhir')
+        ax.set_ylabel('Unit Lulus S1')
+        st.pyplot(fig)
+        st.caption("Fokus: Mahasiswa Dropout cenderung lulus hanya 2-3 unit, yang lulus bisa 5-6 unit.")
+
+
+# ==================================================
+# Bagian 3: Feature Importance (Wawasan Bisnis)
+# ==================================================
+st.header("3. Faktor Pendorong Utama Dropout (Model)")
 feature_importance_df = get_feature_importance(model_pipeline, X_full)
 
+col_imp, col_insight = st.columns([2, 1])
+
 # Visualisasi Feature Importance
-top_n = st.slider("Pilih Jumlah Fitur Teratas untuk Ditampilkan:", 5, 20, 15)
+with col_imp:
+    top_n = st.slider("Pilih Jumlah Fitur Teratas:", 5, 20, 10)
+    fig_imp, ax_imp = plt.subplots(figsize=(8, 6))
+    sns.barplot(
+        data=feature_importance_df.head(top_n), 
+        x='Importance', 
+        y='Feature', 
+        palette='magma',
+        ax=ax_imp
+    )
+    ax_imp.set_title(f'Top {top_n} Fitur Terpenting (Sinyal Dini)')
+    ax_imp.set_xlabel('Tingkat Kepentingan')
+    ax_imp.set_ylabel('Fitur')
+    plt.tight_layout()
+    st.pyplot(fig_imp)
 
-fig_imp, ax_imp = plt.subplots(figsize=(10, 8))
-sns.barplot(
-    data=feature_importance_df.head(top_n), 
-    x='Importance', 
-    y='Feature', 
-    palette='viridis',
-    ax=ax_imp
-)
-ax_imp.set_title(f'Top {top_n} Fitur Terpenting untuk Memprediksi Dropout')
-ax_imp.set_xlabel('Tingkat Kepentingan (Gini Importance)')
-ax_imp.set_ylabel('Fitur')
-plt.tight_layout()
-st.pyplot(fig_imp)
+# Actionable Insights di kolom terpisah
+with col_insight:
+    st.subheader("Actionable Summary")
+    st.markdown("""
+    Model menekankan bahwa **performa akademik** di S1 lebih penting daripada nilai masuk atau faktor sosio-ekonomi lainnya.
+    
+    1.  **Prioritas Tertinggi (Akademik):** Rata-rata Nilai S1 (`Curricular units 1st sem (grade)`) dan Jumlah Unit Lulus S1 (`Curricular units 1st sem (approved)`).
+    2.  **Sinyal Cepat (Finansial):** Kelancaran UKT (`Tuition fees up to date`) adalah *flag* risiko yang paling mudah didapat.
+    3.  **Potensi *Bias*:** Perluasan beasiswa (`Scholarship holder`) adalah intervensi yang terbukti efektif.
+    """)
 
-st.subheader("📝 Actionable Insights dari Top 5 Fitur:")
-top_5 = feature_importance_df.head(5)['Feature'].tolist()
-st.markdown(f"""
-* **1. `{top_5[0]}`:** Faktor akademik ini adalah penentu terkuat. Intervensi harus fokus pada peningkatan nilai S1.
-* **2. `{top_5[1]}`:** Keberhasilan menyelesaikan unit S1 adalah indikator utama. Mahasiswa yang lulus kurang dari 3 unit (dari EDA) berisiko tinggi.
-* **3. `{top_5[2]}`:** Status pembayaran UKT adalah sinyal finansial krisis yang harus diprioritaskan untuk bantuan.
-* **4. `{top_5[3]}`:** Menariknya, Nilai Masuk memiliki pengaruh yang lebih kecil daripada performa aktual S1.
-* **5. `{top_5[4]}`:** Penerima Beasiswa jauh lebih kecil kemungkinannya untuk *dropout*. Ini mendukung investasi dalam program beasiswa.
-""")
-
-def get_feature_importance(model_pipeline, X_full):
-    """
-    Extracts feature importance from a pipeline containing a preprocessor and a classifier.
-
-    Args:
-        model_pipeline: A scikit-learn Pipeline object.
-        X_full: The original DataFrame of features (before train/test split).
-
-    Returns:
-        A pandas DataFrame with 'Feature' names and their 'Importance',
-        sorted by importance in descending order.
-    """
-    # Get the trained classifier from the pipeline
-    classifier = model_pipeline.named_steps['classifier']
-
-    # Get the preprocessor from the pipeline
-    preprocessor = model_pipeline.named_steps['preprocessor']
-
-    # Get the feature names after preprocessing
-    # This method is available in ColumnTransformer after fitting
-    try:
-        feature_names = preprocessor.get_feature_names_out()
-    except Exception as e:
-        print(f"Could not get feature names from preprocessor: {e}")
-        # Fallback: try to get feature names from the original columns and OHE names
-        # This requires knowing the structure of the preprocessor
-        try:
-            numeric_features_processed = preprocessor.named_transformers_['num'].get_feature_names_out() # Scaled numerical features
-            categorical_features_processed = preprocessor.named_transformers_['cat'].named_steps['onehot'].get_feature_names_out(X_full.columns[preprocessor.transformers_[1][2]]) # One-hot encoded categorical features
-            binary_features_processed = preprocessor.named_transformers_['bin'].get_feature_names_out() # Binary features
-
-            # Combine feature names in the correct order
-            feature_names = list(numeric_features_processed) + list(categorical_features_processed) + list(binary_features_processed)
-
-            # Filter out columns that were dropped by the preprocessor
-            # This is a heuristic and might not be perfect
-            original_cols_processed = preprocessor.transform(X_full).shape[1]
-            if len(feature_names) != original_cols_processed:
-                print("Warning: Mismatch between generated feature names and preprocessor output shape.")
-                # As a last resort, create generic names if mismatch occurs
-                feature_names = [f'feature_{i}' for i in range(original_cols_processed)]
-
-
-        except Exception as e_fallback:
-            print(f"Fallback feature name generation failed: {e_fallback}")
-            # If all attempts fail, use generic names
-            feature_names = [f'feature_{i}' for i in range(preprocessor.transform(X_full).shape[1])]
-            print("Using generic feature names.")
-
-
-    # Get feature importances from the classifier
-    importances = classifier.feature_importances_
-
-    # Create a DataFrame
-    feature_importance_df = pd.DataFrame({
-        'Feature': feature_names,
-        'Importance': importances
-    }).sort_values(by='Importance', ascending=False)
-
-    return feature_importance_df
 
 # ==================================================
-# Bagian 3: Prediksi Interaktif (Risk Checker)
+# Bagian 4: Prediksi Interaktif (Risk Checker)
 # ==================================================
-st.header("3. Prediksi Risiko Individual (Risk Checker)")
-st.sidebar.header("Input Data Mahasiswa S1")
+st.header("4. Prediksi Risiko Individual")
+st.markdown("Gunakan panel di *sidebar* untuk menyesuaikan input mahasiswa dan memprediksi risikonya.")
 
-# Sidebar Input: Fitur Akademik
-st.sidebar.subheader("Data Akademik Semester 1")
-input_grade = st.sidebar.number_input(
-    'Rata-rata Nilai S1 (Curricular units 1st sem (grade))', 
+# Input untuk Sidebar (diulang untuk memastikan kode lengkap)
+st.sidebar.markdown("---")
+st.sidebar.subheader("Input Data Mahasiswa S1")
+
+# Input Akademik
+st.sidebar.caption("Sinyal Akademik S1")
+input_grade = st.sidebar.slider(
+    'Rata-rata Nilai S1', 
     min_value=0.0, max_value=20.0, value=10.0, step=0.1
 )
-input_approved = st.sidebar.number_input(
-    'Unit Kurikuler Lulus S1 (Curricular units 1st sem (approved))', 
-    min_value=0, max_value=20, value=3
+input_approved = st.sidebar.slider(
+    'Unit Kurikuler Lulus S1', 
+    min_value=0, max_value=10, value=3
 )
-input_admission_grade = st.sidebar.number_input(
-    'Nilai Masuk (Admission grade)', 
-    min_value=95.0, max_value=190.0, value=127.0, step=0.1
+input_admission_grade = st.sidebar.slider(
+    'Nilai Masuk', 
+    min_value=95.0, max_value=190.0, value=127.0, step=1.0
 )
 
-# Sidebar Input: Fitur Finansial
-st.sidebar.subheader("Status Finansial/Sosial")
+# Input Finansial
+st.sidebar.caption("Sinyal Finansial")
 input_fees = st.sidebar.selectbox(
-    'UKT Lancar? (Tuition fees up to date)', 
+    'UKT Lancar? (1=Ya, 0=Tidak)', 
     options=[1, 0], format_func=lambda x: 'Ya (1)' if x == 1 else 'Tidak (0)'
 )
 input_scholarship = st.sidebar.selectbox(
-    'Penerima Beasiswa? (Scholarship holder)', 
+    'Penerima Beasiswa? (1=Ya, 0=Tidak)', 
     options=[0, 1], format_func=lambda x: 'Ya (1)' if x == 1 else 'Tidak (0)'
 )
-input_debtor = st.sidebar.selectbox(
-    'Memiliki Hutang? (Debtor)', 
-    options=[0, 1], format_func=lambda x: 'Ya (1)' if x == 1 else 'Tidak (0)'
-)
-input_age = st.sidebar.number_input('Usia Saat Masuk (Age at enrollment)', min_value=17, max_value=70, value=20)
+
+# Input Demografis
+st.sidebar.caption("Sinyal Demografis")
+input_age = st.sidebar.number_input('Usia Saat Masuk', min_value=17, max_value=70, value=20)
 
 
 # --- Membuat Input DataFrame ---
-# Membuat DataFrame tunggal untuk prediksi dengan nilai default untuk semua kolom
-# Kolom yang tidak diinput user akan diisi dengan median/modus dari data latih (X_train)
-input_data = X_train.head(1).copy() 
-input_data.iloc[0] = X_train.mode().iloc[0] # Isi dengan modus/median data latih
+if 'input_data' not in st.session_state:
+    st.session_state.input_data = X_train.head(1).copy() 
+    for col in st.session_state.input_data.columns:
+        if col in NUMERIC_FEATURES:
+            st.session_state.input_data.loc[:, col] = X_train[col].median()
+        else:
+            st.session_state.input_data.loc[:, col] = X_train[col].mode().iloc[0]
 
-# Override dengan Input User
-input_data.loc[:, 'Curricular units 1st sem (grade)'] = input_grade
-input_data.loc[:, 'Curricular units 1st sem (approved)'] = input_approved
-input_data.loc[:, 'Admission grade'] = input_admission_grade
-input_data.loc[:, 'Tuition fees up to date'] = input_fees
-input_data.loc[:, 'Scholarship holder'] = input_scholarship
-input_data.loc[:, 'Debtor'] = input_debtor
-input_data.loc[:, 'Age at enrollment'] = input_age
+current_input_data = st.session_state.input_data.copy()
+current_input_data.loc[:, 'Curricular units 1st sem (grade)'] = input_grade
+current_input_data.loc[:, 'Curricular units 1st sem (approved)'] = input_approved
+current_input_data.loc[:, 'Admission grade'] = input_admission_grade
+current_input_data.loc[:, 'Tuition fees up to date'] = input_fees
+current_input_data.loc[:, 'Scholarship holder'] = input_scholarship
+current_input_data.loc[:, 'Age at enrollment'] = input_age
+current_input_data.loc[:, 'Debtor'] = 0 # Defaultkan Debtor menjadi 0
 
 
-# Lakukan Prediksi
-if st.sidebar.button('Hitung Risiko Dropout'):
-    # Prediksi Probabilitas
-    risk_proba = model_pipeline.predict_proba(input_data)[0][1] * 100
-    
-    st.subheader("Hasil Prediksi Risiko")
-    
-    col_risk1, col_risk2 = st.columns(2)
-    
-    col_risk1.metric(
-        "Probabilitas Dropout", 
-        f"{risk_proba:.2f}%"
-    )
+if st.button('Hitung Risiko Mahasiswa'):
+    with st.spinner('Menghitung risiko...'):
+        risk_proba = model_pipeline.predict_proba(current_input_data)[0][1] * 100
+        
+        st.subheader("Hasil Prediksi Risiko")
+        
+        col_risk1, col_risk2 = st.columns(2)
+        
+        col_risk1.metric(
+            "Probabilitas Dropout", 
+            f"{risk_proba:.2f}%"
+        )
 
-    if risk_proba >= 50:
-        risk_level = "SANGAT TINGGI"
-        color = "#ff4b4b"
-    elif risk_proba >= 30:
-        risk_level = "TINGGI"
-        color = "#ffa500"
-    else:
-        risk_level = "RENDAH"
-        color = "#008000"
+        if risk_proba >= 50:
+            risk_level = "KRITIS"
+            color = "#ff4b4b"
+        elif risk_proba >= 30:
+            risk_level = "TINGGI"
+            color = "#ffa500"
+        else:
+            risk_level = "RENDAH"
+            color = "#008000"
 
-    col_risk2.markdown(
-        f"""
-        <div style="
-            background-color: {color}; 
-            color: white; 
-            padding: 15px; 
-            border-radius: 5px; 
-            text-align: center;
-            font-size: 18px;
-            font-weight: bold;
-        ">
-        Tingkat Risiko: {risk_level}
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-    
-    st.markdown("---")
-    if risk_proba >= 30:
-        st.warning("⚠️ **Rekomendasi Intervensi:** Mahasiswa ini memerlukan konseling akademik segera dan evaluasi status finansial. Fokus pada unit-unit yang gagal di S1.")
-    else:
-        st.success("✅ **Rekomendasi:** Risiko rendah. Tetap pantau perkembangan di semester selanjutnya.")
+        col_risk2.markdown(
+            f"""
+            <div style="
+                background-color: {color}; 
+                color: white; 
+                padding: 15px; 
+                border-radius: 5px; 
+                text-align: center;
+                font-size: 18px;
+                font-weight: bold;
+            ">
+            Tingkat Risiko: {emoji} {risk_level}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        
+        st.markdown("---")
+        if risk_proba >= 30:
+            st.error("❗ **TINDAKAN SEGERA DIPERLUKAN:** Mahasiswa ini memerlukan intervensi terfokus. Kontak segera dengan konselor akademis dan unit bantuan keuangan.")
+        else:
+            st.info("👍 **TINDAKAN PANTUAN:** Risiko rendah. Tetap pantau secara berkala.")
